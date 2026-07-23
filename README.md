@@ -13,7 +13,7 @@ NAMAT is a graph neural network for cancer driver gene prioritization that integ
 
 ## Requirements
 
-- Python 3.9+
+- python 3.9+
 - torch >= 2.0
 - numpy >= 1.23
 - pandas >= 1.5
