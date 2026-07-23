@@ -385,7 +385,7 @@ def parse_args():
     parser.add_argument("--root", type=str, default="./Data",
                          help="Path to the Data folder containing PPI/, labels/, node_features/ subfolders")
     parser.add_argument("--outdir", type=str, default="./outputs",
-                         help="Where to write checkpoints and the universe-nodes cache")
+                         help="Directory for the universe-nodes cache")
     parser.add_argument("--cancer", type=str, default="BLCA", help="Cancer type code (e.g. BLCA, BRCA, LUAD)")
     parser.add_argument("--n_runs", type=int, default=10, help="Number of repeated runs with different seeds")
     parser.add_argument("--seed", type=int, default=42, help="Base random seed")
