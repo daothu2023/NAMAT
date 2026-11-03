@@ -1,4 +1,5 @@
 import argparse
+import itertools
 import os
 import warnings
 from dataclasses import dataclass, replace
@@ -71,6 +72,50 @@ class Config:
     LIN_IN_HIDDEN: int = 64
     LIN_IN_OUT_DIM: int = 64
 
+# ===================== Hyperparameter search space (mode="grid") =====================
+# Every key is a Config field. A list with one value keeps that hyperparameter fixed;
+# a list with several values adds it to the grid search. To search more values,
+# add them to the corresponding list. All combinations are evaluated.
+# In grid mode these values are used instead of the corresponding command-line arguments.
+SEARCH_SPACE = {
+    "LR": [1e-3, 1e-4],
+    "LIN_IN_LAYERS": [2, 3],
+    "DROPOUT": [0.4, 0.3],
+    "WEIGHT_DECAY": [4e-4],
+    "LIN_IN_HIDDEN": [64],
+    "LIN_IN_OUT_DIM": [64],
+    "HIDS": [[64, 128]],
+    "FEATDROP_P": [0.20],
+    "PPI_DROPOUT_P": [0.25],
+    "LABEL_SMOOTHING": [0.06],
+    "FUSION_TEMP_START": [0.8],
+    "FUSION_TEMP_END": [0.6],
+    "GATE_WARMUP_EPOCHS": [30],
+}
+
+
+def build_candidate_configs(cfg) -> List[Dict]:
+    """All combinations of SEARCH_SPACE (combinations with FUSION_TEMP_START < FUSION_TEMP_END are skipped)."""
+    for k in SEARCH_SPACE:
+        if not hasattr(cfg, k):
+            raise KeyError(f"SEARCH_SPACE key '{k}' is not a Config field")
+    keys = list(SEARCH_SPACE)
+    candidates = []
+    for values in itertools.product(*(SEARCH_SPACE[k] for k in keys)):
+        hp = dict(zip(keys, values))
+        if hp.get("FUSION_TEMP_START", cfg.FUSION_TEMP_START) < hp.get("FUSION_TEMP_END", cfg.FUSION_TEMP_END):
+            continue
+        candidates.append(hp)
+    if len(candidates) == 0:
+        raise ValueError("SEARCH_SPACE produced no valid configuration.")
+    return candidates
+
+
+def format_hp(hp: Dict) -> str:
+    """One-line description of the searched hyperparameters (those with more than one value)."""
+    searched = [k for k in SEARCH_SPACE if len(SEARCH_SPACE[k]) > 1] or list(SEARCH_SPACE)
+    return ", ".join(f"{k}={hp[k]}" for k in searched)
+
 
 def build_ppi_paths(root: str) -> Dict[str, str]:
     ppi_dir = f"{root}/PPI"
@@ -119,153 +164,101 @@ def make_cfg(args) -> Config:
     )
 
 
-def train_namat(nodes, X_final, A_list, mask_list, logdeg_list, y_np, splits, cfg: Config, run_id: int):
+def train_one_fold(Xd, Ad, mask_list, logdeg_list, y_np, y_full, train_sel, val_sel, test_sel, cfg: Config, fold: int):
+    """Train NAMAT on one fold (early stopping on validation loss) and return (val AUPRC, test AUPRC)
+    of the best-validation-loss checkpoint, or None if no valid checkpoint was obtained."""
     device = cfg.DEVICE
-    N = len(nodes)
+    N = Xd.shape[0]
 
-    Xd = X_final.to(device)
-    Ad = [A.to(device) for A in A_list]
-    y_full = torch.tensor(y_np, dtype=torch.float32, device=device)
+    train_sel = np.asarray(train_sel, dtype=np.int64)
+    val_sel = np.asarray(val_sel, dtype=np.int64)
+    test_sel = np.asarray(test_sel, dtype=np.int64)
 
-    mask_list = [m.to(device) for m in mask_list]
-    logdeg_list = [d.to(device) for d in logdeg_list]
+    train_mask = torch.zeros(N, dtype=torch.bool, device=device)
+    val_mask = torch.zeros(N, dtype=torch.bool, device=device)
+    train_mask[torch.tensor(train_sel, device=device)] = True
+    val_mask[torch.tensor(val_sel, device=device)] = True
 
-    fold_test = []
+    model = NAMAT(
+        in_dim=Xd.shape[1],
+        hids=cfg.HIDS,
+        dropout=cfg.DROPOUT,
+        featdrop_p=cfg.FEATDROP_P,
+        use_deg_aware=cfg.USE_DEG_AWARE,
+        lin_in_layers=cfg.LIN_IN_LAYERS,
+        lin_in_hidden=cfg.LIN_IN_HIDDEN,
+        lin_in_out_dim=cfg.LIN_IN_OUT_DIM,
+    ).to(device)
 
-    for fold, (train_sel, val_sel, test_sel) in enumerate(splits, start=1):
-        train_sel = np.asarray(train_sel, dtype=np.int64)
-        val_sel = np.asarray(val_sel, dtype=np.int64)
-        test_sel = np.asarray(test_sel, dtype=np.int64)
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
 
-        train_mask = torch.zeros(N, dtype=torch.bool, device=device)
-        val_mask = torch.zeros(N, dtype=torch.bool, device=device)
-        train_mask[torch.tensor(train_sel, device=device)] = True
-        val_mask[torch.tensor(val_sel, device=device)] = True
+    best_val_loss = float("inf")
+    best_state = None
+    no_imp = 0
 
-        model = NAMAT(
-            in_dim=Xd.shape[1],
-            hids=cfg.HIDS,
-            dropout=cfg.DROPOUT,
-            featdrop_p=cfg.FEATDROP_P,
-            use_deg_aware=cfg.USE_DEG_AWARE,
-            lin_in_layers=cfg.LIN_IN_LAYERS,
-            lin_in_hidden=cfg.LIN_IN_HIDDEN,
-            lin_in_out_dim=cfg.LIN_IN_OUT_DIM,
-        ).to(device)
+    for ep in range(cfg.MAX_EPOCHS):
+        for group in opt.param_groups:
+            group["lr"] = cosine_warmup_lr(ep, cfg.MAX_EPOCHS, cfg.LR, warmup=cfg.WARMUP_EPOCHS)
 
-        opt = torch.optim.AdamW(model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
+        temp = (
+            (cfg.FUSION_TEMP_START - cfg.FUSION_TEMP_END)
+            * max(0, cfg.MAX_EPOCHS - 1 - ep)
+            / max(1, cfg.MAX_EPOCHS - 1)
+            + cfg.FUSION_TEMP_END
+        )
 
-        best_val_loss = float("inf")
-        best_state = None
-        no_imp = 0
+        force_uniform = ep < cfg.GATE_WARMUP_EPOCHS
+        ppi_dropout = 0.0 if force_uniform else cfg.PPI_DROPOUT_P
 
-        for ep in range(cfg.MAX_EPOCHS):
-            for group in opt.param_groups:
-                group["lr"] = cosine_warmup_lr(ep, cfg.MAX_EPOCHS, cfg.LR, warmup=cfg.WARMUP_EPOCHS)
+        model.train()
+        opt.zero_grad(set_to_none=True)
 
-            temp = (
-                (cfg.FUSION_TEMP_START - cfg.FUSION_TEMP_END)
-                * max(0, cfg.MAX_EPOCHS - 1 - ep)
-                / max(1, cfg.MAX_EPOCHS - 1)
-                + cfg.FUSION_TEMP_END
+        logits, _ = model(
+            Xd,
+            Ad,
+            mask_list=mask_list,
+            logdeg_list=logdeg_list,
+            temp=temp,
+            force_uniform=force_uniform,
+            ppi_dropout_p=ppi_dropout,
+            mask_deg0=cfg.MASK_DEG0,
+        )
+
+        if not torch.isfinite(logits).all():
+            print(f"[WARN] non-finite logits at ep={ep} -> break")
+            break
+
+        ytr = y_full[train_mask]
+        npos = int((ytr == 1).sum().item())
+        nneg = int((ytr == 0).sum().item())
+
+        posw = None
+        if npos > 0 and nneg > 0:
+            posw = torch.tensor(
+                [min(nneg / max(1, npos), 10.0)],
+                dtype=torch.float32,
+                device=device,
             )
 
-            force_uniform = ep < cfg.GATE_WARMUP_EPOCHS
-            ppi_dropout = 0.0 if force_uniform else cfg.PPI_DROPOUT_P
+        loss = bce_ls(
+            logits[train_mask],
+            y_full[train_mask],
+            pos_weight=posw,
+            eps=cfg.LABEL_SMOOTHING,
+        )
 
-            model.train()
+        loss.backward()
+        total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+        if not torch.isfinite(total_norm):
             opt.zero_grad(set_to_none=True)
-
-            logits, _ = model(
-                Xd,
-                Ad,
-                mask_list=mask_list,
-                logdeg_list=logdeg_list,
-                temp=temp,
-                force_uniform=force_uniform,
-                ppi_dropout_p=ppi_dropout,
-                mask_deg0=cfg.MASK_DEG0,
-            )
-
-            if not torch.isfinite(logits).all():
-                print(f"[WARN] non-finite logits at ep={ep} -> break")
-                break
-
-            ytr = y_full[train_mask]
-            npos = int((ytr == 1).sum().item())
-            nneg = int((ytr == 0).sum().item())
-
-            posw = None
-            if npos > 0 and nneg > 0:
-                posw = torch.tensor(
-                    [min(nneg / max(1, npos), 10.0)],
-                    dtype=torch.float32,
-                    device=device,
-                )
-
-            loss = bce_ls(
-                logits[train_mask],
-                y_full[train_mask],
-                pos_weight=posw,
-                eps=cfg.LABEL_SMOOTHING,
-            )
-
-            loss.backward()
-            total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
-            if not torch.isfinite(total_norm):
-                opt.zero_grad(set_to_none=True)
-                continue
-
-            opt.step()
-
-            model.eval()
-            with torch.no_grad():
-                v_logits, _ = model(
-                    Xd,
-                    Ad,
-                    mask_list=mask_list,
-                    logdeg_list=logdeg_list,
-                    temp=cfg.FUSION_TEMP_END,
-                    force_uniform=False,
-                    ppi_dropout_p=0.0,
-                    mask_deg0=cfg.MASK_DEG0,
-                )
-
-            v_loss = bce_ls(
-                v_logits[val_mask],
-                y_full[val_mask],
-                pos_weight=posw,
-                eps=cfg.LABEL_SMOOTHING,
-            )
-            val_loss = v_loss.item()
-
-            val_ap = safe_auprc_from_logits(v_logits[val_sel], y_np[val_sel].astype(np.int64))
-
-            if ep % 40 == 0 or ep == cfg.MAX_EPOCHS - 1:
-                print(
-                    f"[Fold {fold} | ep={ep:03d}] "
-                    f"val_AUPRC={val_ap:.4f}"
-                )
-
-            if val_loss < best_val_loss - 1e-6:
-                best_val_loss = val_loss
-                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-                no_imp = 0
-            else:
-                no_imp += 1
-                if no_imp >= cfg.PATIENCE:
-                    break
-
-        if best_state is None:
-            print(f"[WARN] Fold {fold}: best_state None -> skip fold")
             continue
 
-        model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
-        model.eval()
+        opt.step()
 
+        model.eval()
         with torch.no_grad():
-            logits_best, _ = model(
+            v_logits, _ = model(
                 Xd,
                 Ad,
                 mask_list=mask_list,
@@ -276,8 +269,101 @@ def train_namat(nodes, X_final, A_list, mask_list, logdeg_list, y_np, splits, cf
                 mask_deg0=cfg.MASK_DEG0,
             )
 
-        val_ap_final = safe_auprc_from_logits(logits_best[val_sel], y_np[val_sel].astype(np.int64))
-        test_ap_final = safe_auprc_from_logits(logits_best[test_sel], y_np[test_sel].astype(np.int64))
+        v_loss = bce_ls(
+            v_logits[val_mask],
+            y_full[val_mask],
+            pos_weight=posw,
+            eps=cfg.LABEL_SMOOTHING,
+        )
+        val_loss = v_loss.item()
+
+        val_ap = safe_auprc_from_logits(v_logits[val_sel], y_np[val_sel].astype(np.int64))
+
+        if ep % 40 == 0 or ep == cfg.MAX_EPOCHS - 1:
+            print(
+                f"[Fold {fold} | ep={ep:03d}] "
+                f"val_AUPRC={val_ap:.4f}"
+            )
+
+        if val_loss < best_val_loss - 1e-6:
+            best_val_loss = val_loss
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            no_imp = 0
+        else:
+            no_imp += 1
+            if no_imp >= cfg.PATIENCE:
+                break
+
+    if best_state is None:
+        return None
+
+    model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+    model.eval()
+
+    with torch.no_grad():
+        logits_best, _ = model(
+            Xd,
+            Ad,
+            mask_list=mask_list,
+            logdeg_list=logdeg_list,
+            temp=cfg.FUSION_TEMP_END,
+            force_uniform=False,
+            ppi_dropout_p=0.0,
+            mask_deg0=cfg.MASK_DEG0,
+        )
+
+    val_ap_final = safe_auprc_from_logits(logits_best[val_sel], y_np[val_sel].astype(np.int64))
+    test_ap_final = safe_auprc_from_logits(logits_best[test_sel], y_np[test_sel].astype(np.int64))
+    return float(val_ap_final), float(test_ap_final)
+
+
+def train_namat(nodes, X_final, A_list, mask_list, logdeg_list, y_np, splits, cfg: Config, run_id: int,
+                mode: str = "grid"):
+    """mode="fixed": one hyperparameter configuration (cfg) for every fold.
+    mode="grid": for every fold, train each configuration in SEARCH_SPACE on the training split with
+    early stopping on validation loss, select the configuration with the highest validation AUPRC,
+    retrain it once, and evaluate the retrained model on the held-out test fold."""
+    device = cfg.DEVICE
+
+    Xd = X_final.to(device)
+    Ad = [A.to(device) for A in A_list]
+    y_full = torch.tensor(y_np, dtype=torch.float32, device=device)
+
+    mask_list = [m.to(device) for m in mask_list]
+    logdeg_list = [d.to(device) for d in logdeg_list]
+
+    candidates = build_candidate_configs(cfg) if mode == "grid" else None
+
+    fold_test = []
+
+    for fold, (train_sel, val_sel, test_sel) in enumerate(splits, start=1):
+        args_fold = (Xd, Ad, mask_list, logdeg_list, y_np, y_full, train_sel, val_sel, test_sel)
+
+        if mode == "grid":
+            best_hp, best_val_auprc = None, -1.0
+            for i, hp in enumerate(candidates, start=1):
+                print(f"[Fold {fold}/{cfg.N_FOLDS}] Candidate configuration {i}/{len(candidates)}: {format_hp(hp)}")
+                res = train_one_fold(*args_fold, replace(cfg, **hp), fold)
+                if res is None:
+                    print(f"[WARN] Fold {fold}: best_state None -> skip candidate")
+                    continue
+                print(f"[Fold {fold}/{cfg.N_FOLDS}] Validation: AUPRC={res[0]:.4f}")
+                if res[0] > best_val_auprc:
+                    best_val_auprc, best_hp = res[0], hp
+            if best_hp is None:
+                print(f"[WARN] Fold {fold}: no valid candidate -> skip fold")
+                continue
+            print(f"[Fold {fold}/{cfg.N_FOLDS}] Selected configuration: {format_hp(best_hp)}, "
+                  f"validation AUPRC={best_val_auprc:.4f}")
+            cfg_fold = replace(cfg, **best_hp)          # retrain once with the selected configuration
+        else:
+            cfg_fold = cfg
+
+        res = train_one_fold(*args_fold, cfg_fold, fold)
+        if res is None:
+            print(f"[WARN] Fold {fold}: best_state None -> skip fold")
+            continue
+        val_ap_final, test_ap_final = res
         fold_test.append(float(test_ap_final))
 
         print(
@@ -289,7 +375,7 @@ def train_namat(nodes, X_final, A_list, mask_list, logdeg_list, y_np, splits, cf
     return fold_test
 
 
-def main_one(cfg: Config, cancer: str, run_id: int = 1):
+def main_one(cfg: Config, cancer: str, run_id: int = 1, mode: str = "grid"):
     set_seed(cfg.SEED)
     os.makedirs(cfg.OUTDIR, exist_ok=True)
 
@@ -345,6 +431,7 @@ def main_one(cfg: Config, cancer: str, run_id: int = 1):
         splits,
         cfg,
         run_id,
+        mode=mode,
     )
 
     print(
@@ -357,12 +444,12 @@ def main_one(cfg: Config, cancer: str, run_id: int = 1):
     return au_6ppi
 
 
-def main_n_runs(cfg: Config, cancer: str, n_runs: int = 1):
+def main_n_runs(cfg: Config, cancer: str, n_runs: int = 1, mode: str = "grid"):
     all_6 = []
 
     for r in range(n_runs):
         cfg_r = replace(cfg, SEED=cfg.SEED + r)
-        au6 = main_one(cfg_r, cancer=cancer, run_id=r + 1)
+        au6 = main_one(cfg_r, cancer=cancer, run_id=r + 1, mode=mode)
         all_6.extend(au6)
 
     print("\n" + "=" * 80)
@@ -389,6 +476,9 @@ def parse_args():
     parser.add_argument("--cancer", type=str, default="BLCA", help="Cancer type code (e.g. BLCA, BRCA, LUAD)")
     parser.add_argument("--n_runs", type=int, default=10, help="Number of repeated runs with different seeds")
     parser.add_argument("--seed", type=int, default=42, help="Base random seed")
+    parser.add_argument("--mode", type=str, default="grid", choices=["grid", "fixed"],
+                        help="grid: per-fold grid search over SEARCH_SPACE (selection by validation AUPRC, then retraining); "
+                             "fixed: a single configuration given by the command-line arguments")
 
     parser.add_argument("--features_csv", type=str, default=None, help="Override path to the features CSV file")
     parser.add_argument("--features_gene_col", type=str, default="gene", help="Column name for gene identifiers in the features CSV")
@@ -426,4 +516,9 @@ if __name__ == "__main__":
     args = parse_args()
     cfg = make_cfg(args)
     print("Using device:", cfg.DEVICE)
-    main_n_runs(cfg, cancer=args.cancer, n_runs=args.n_runs)
+    if args.mode == "grid":
+        n_cand = len(build_candidate_configs(cfg))
+        print(f"Mode: grid search over {n_cand} configurations per fold (+1 retraining)")
+    else:
+        print("Mode: fixed configuration")
+    main_n_runs(cfg, cancer=args.cancer, n_runs=args.n_runs, mode=args.mode)
