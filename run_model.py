@@ -446,21 +446,25 @@ def main_one(cfg: Config, cancer: str, run_id: int = 1, mode: str = "grid"):
 
 def main_n_runs(cfg: Config, cancer: str, n_runs: int = 1, mode: str = "grid"):
     all_6 = []
+    run_means = []   # one value per run: test AUPRC averaged over its folds
 
     for r in range(n_runs):
         cfg_r = replace(cfg, SEED=cfg.SEED + r)
         au6 = main_one(cfg_r, cancer=cancer, run_id=r + 1, mode=mode)
         all_6.extend(au6)
+        if len(au6):
+            run_means.append(float(np.mean(au6)))
 
     print("\n" + "=" * 80)
-    print("[ALL RUNS SUMMARY] Test AUPRC (mean ± std)")
-    if len(all_6):
+    print("[ALL RUNS SUMMARY] Test AUPRC (mean ± std across run-level means)")
+    if len(run_means):
         print(
             f"NAMAT : "
-            f"{float(np.mean(all_6)):.4f} ± "
-            f"{float(np.std(all_6)):.4f} "
-            f"(n={len(all_6)})"
+            f"{float(np.mean(run_means)):.4f} ± "
+            f"{float(np.std(run_means)):.4f} "
+            f"(n_runs={len(run_means)}, n_folds_total={len(all_6)})"
         )
+        print("   per-run means: " + ", ".join(f"{m:.4f}" for m in run_means))
 
 
 def parse_args():
